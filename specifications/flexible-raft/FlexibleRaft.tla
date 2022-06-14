@@ -6,6 +6,23 @@ by Diego Ongaro which can be found here: https://github.com/ongardie/raft.tla
 
 This variant takes the principles of Flexible Paxos and
 applies them to Raft.
+
+Notes on flexible quorums:
+- all replication quorums must intersect with all election quorums
+- all election quorums must intersect else it is possible to elect
+  two different leaders in the same term which leads to log divergence
+  and data loss.
+  
+The following are valid:
+
+| Replication quorum | Election quorum |
+|--------------------|-----------------|
+| 5                  | 3               |
+| 4                  | 3               |
+| 3                  | 3               |
+| 2                  | 4               |
+| 1                  | 5               |
+
 *)
 
 EXTENDS Naturals, FiniteSets, Sequences, TLC
@@ -386,7 +403,9 @@ RejectAppendEntriesRequest ==
 \* In one step it can:
 \* - truncate the log
 \* - append an entry to the log
-\* - respond to the leader         
+\* - respond to the leader
+\* Note that if the follower already has a matching entry in its log
+\* it leaves the log as-is and returns a success response.      
 CanAppend(m, i) ==
     /\ m.mentries /= << >>
     /\ Len(log[i]) = m.mprevLogIndex
