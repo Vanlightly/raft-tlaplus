@@ -122,12 +122,32 @@ Quorum == {i \in SUBSET(Server) : Cardinality(i) * 2 > Cardinality(Server)}
 \* The term of the last entry in a log, or 0 if the log is empty.
 LastTerm(xlog) == IF Len(xlog) = 0 THEN 0 ELSE xlog[Len(xlog)].term
 
-\* Add a message to the bag of messages.
-Send(m) == 
+\* Send the message whether it already exists or not.
+_SendNoRestriction(m) ==
+    IF m \in DOMAIN messages
+    THEN messages' = [messages EXCEPT ![m] = @ + 1]
+    ELSE messages' = messages @@ (m :> 1)
+    
+\* Will only send the message if it hasn't been sent before.
+\* Basically disables the parent action once sent.    
+_SendOnce(m) ==
     /\ m \notin DOMAIN messages
-    /\ messages' = messages @@ (m :> 1)
+    /\ messages' = messages @@ (m :> 1)    
 
-SendMultiple(msgs) ==
+\* Add a message to the bag of messages. 
+\* Note 1: to prevent infinite cycles, empty 
+\* AppendEntriesRequest messages can only be sent once.
+\* Note 2: a message can only match an existing message
+\* if it is identical (all fields).
+Send(m) ==
+    IF /\ m.mtype = AppendEntriesRequest
+       /\ m.mentries = <<>>
+    THEN _SendOnce(m)
+    ELSE _SendNoRestriction(m)
+
+\* Will only send the messages if it hasn't done so before
+\* Basically disables the parent action once sent.
+SendMultipleOnce(msgs) ==
     /\ \A m \in msgs : m \notin DOMAIN messages
     /\ messages' = messages @@ [msg \in msgs |-> 1]    
 
@@ -146,8 +166,11 @@ Discard(m) ==
 \* Combination of Send and Discard
 Reply(response, request) ==
     /\ messages[request] > 0 \* request must exist
-    /\ response \notin DOMAIN messages \* response does not exist
-    /\ messages' = [messages EXCEPT ![request] = @ - 1] @@ (response :> 1)
+    /\ \/ /\ response \notin DOMAIN messages \* response does not exist, so add it
+          /\ messages' = [messages EXCEPT ![request] = @ - 1] @@ (response :> 1)
+       \/ /\ response \in DOMAIN messages \* response was sent previously, so increment delivery counter
+          /\ messages' = [messages EXCEPT ![request] = @ - 1,
+                                          ![response] = @ + 1]
 
 \* The message is of the type and has a matching term.
 \* Messages with a higher term are handled by the
@@ -219,7 +242,7 @@ RequestVote(i) ==
     /\ votedFor' = [votedFor EXCEPT ![i] = i] \* votes for itself
     /\ votesGranted'   = [votesGranted EXCEPT ![i] = {i}] \* votes for itself
     /\ electionCtr' = electionCtr + 1
-    /\ SendMultiple(
+    /\ SendMultipleOnce(
            {[mtype         |-> RequestVoteRequest,
              mterm         |-> currentTerm[i] + 1,
              mlastLogTerm  |-> LastTerm(log[i]),
@@ -410,7 +433,6 @@ CanAppend(m, i) ==
 NeedsTruncation(m, i, index) ==
    /\ m.mentries /= << >>
    /\ Len(log[i]) >= index
-   /\ log[i][index].term /= m.mentries[1].term
 
 TruncateLog(m, i) ==
     [index \in 1..m.mprevLogIndex |-> log[i][index]]
@@ -503,9 +525,26 @@ Next ==
 
 \* The specification must start with the initial state and transition according
 \* to Next.
+NoStuttering ==
+    WF_vars(Next)
+
 Spec == Init /\ [][Next]_vars
 
+LivenessSpec == Init /\ [][Next]_vars /\ NoStuttering
+
 ----
+\* LIVENESS   -------------------------
+
+\* Liveness: AllEntriesReplicated
+\* Only use this when MaxElections = 1 and in odd-sized clusters
+\* given that the one permitted election may not succeed
+AllEntriesReplicated ==
+    []<>(\A v \in Value : 
+            \A s \in Server : 
+                \E index \in DOMAIN log[s] :
+                    log[s][index].value = v) 
+
+
 \* INVARIANTS -------------------------
 
 MinCommitIndex(s1, s2) ==
