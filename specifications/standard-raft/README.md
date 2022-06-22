@@ -22,101 +22,129 @@ The most obvious fix is to ensure that servers generate a unique id on boot from
 An example history:
 
 Initial state:
+```
 Servers: {s1, s2, s3, s4, s5}
 Cluster: {s1, s2, s3 }, leader is s3
 s1 has become unroutable (weird EC2 issue).
+```
 
 Step 1: Leader adds OldNewConfigCommand to replace s1 with s4 and replicates to a majority of the old and a majority of the new config.
+```
 s1: c1{s1, s2, s3} unreachable
 s2: c2 old{s1, s2, s3}, new{s2, s3, s4}
 s3: c2 old{s1, s2, s3}, new{s2, s3, s4} Leader
 s4: c2 old{s1, s2, s3}, new{s2, s3, s4}
 s5: {}
+```
 
 Step 2: Leader adds NewConfigCommand to commit the reconfig and replicates to a majority of the new configuration.
+```
 s1: c1 {s1, s2, s3} unreachable
 s2: c2 old{s1, s2, s3}, new{s2, s3, s4}
 s3: c3 {s2, s3, s4} Leader
 s4: c3 {s2, s3, s4}
 s5: {}
+```
 
 Step 3: s2 data disk failure. Leader adds OldNewConfigCommand to replace s2 with s5 and replicates to a majority of the old and a majority of the new config.
+```
 s1: c1{s1, s2, s3} unreachable
 s2: c2 old{s1, s2, s3}, new{s2, s3, s4} failed
 s3: c4 old{s2, s3, s4}, new{s3, s4, s5} Leader
 s4: c4 old{s2, s3, s4}, new{s3, s4, s5}
 s5: c4 old{s2, s3, s4}, new{s3, s4, s5}
+```
 
 Step 4: Leader adds NewConfigCommand to commit the reconfig and replicates to a majority of the new configuration.
+```
 s1: c1{s1, s2, s3} unreachable
 s2: c2 old{s1, s2, s3}, new{s2, s3, s4} failed
 s3: c5{s3, s4, s5} Leader
 s4: c5{s3, s4, s5}
 s5: c5{s3, s4, s5}
+```
 
 Step 5: Administrator brings back s2 with a new disk and the same identity.
+```
 s1: c1{s1, s2, s3} unreachable
 s2: {}
 s3: c5{s3, s4, s5} Leader
 s4: c5{s3, s4, s5}
 s5: c5{s3, s4, s5}
+```
 
 Step 6: s1 becomes reachable again and it starts an election. s2 votes for s1 and s2 still being on the first configuration has a majority and becomes leader. s1 replicates
 to s2 and s2 truncates it log, assuming configuration c1.
+```
 s1: c1{s1, s2, s3} Leader
 s2: c1{s1, s2, s3}
 s3: c5{s3, s4, s5} Leader
 s4: c5{s3, s4, s5}
 s5: c5{s3, s4, s5}
+```
 
 #### Raft with add/remove reconfiguration - split brain example
 
 An example history:
 
 Initial state:
+```
 Servers: {s1, s2, s3, s4, s5}
 Cluster: {s1, s2, s3 }, leader is s3
 s1 has become unroutable (weird EC2 issue).
+```
 
 Step 1: Leader adds AddServerCommand to add s4 and replicates to a majority of the new configuration.
+```
 s1: c1{s1, s2, s3 } unreachable
 s2: c2{s1, s2, s3, s4}
 s3: c2{s1, s2, s3, s4} Leader
 s4: c2{s1, s2, s3, s4}
 s5: {}
+```
 
 Step 2: Leader adds RemoveServerCommand to remove s1 and replicates to a majority of the new configuration.
-s1: c1{s1, s2, s3 } unreachable
-s2: c2{s1, s2, s3, s4 }
-s3: c3{s2, s3, s4 } Leader
-s4: c3{s2, s3, s4 }
+```
+s1: c1{s1, s2, s3} unreachable
+s2: c2{s1, s2, s3, s4}
+s3: c3{s2, s3, s4} Leader
+s4: c3{s2, s3, s4}
 s5: {}
+```
 
 Step 3: s2 data disk failure. Leader adds AddServerCommand to add s5 and replicates to a majority of the new configuration.
-s1: c1{s1, s2, s3 } unreachable
-s2: c2{s1, s2, s3, s4 } offline
-s3: c4{s2, s3, s4, s5 } Leader
-s4: c4{s2, s3, s4, s5 }
-s5: c4{s2, s3, s4, s5 }
+```
+s1: c1{s1, s2, s3}  unreachable
+s2: c2{s1, s2, s3, s4} offline
+s3: c4{s2, s3, s4, s5} Leader
+s4: c4{s2, s3, s4, s5}
+s5: c4{s2, s3, s4, s5}
+```
 
 Step 4: Leader adds RemoveServerCommand to remove s2 and replicates to a majority of the new configuration.
-s1: c1{s1, s2, s3 } unreachable
-s2: c2{s1, s2, s3, s4 } offline
-s3: c5{s3, s4, s5 } Leader
-s4: c5{s3, s4, s5 }
-s5: c5{s3, s4, s5 }
+```
+s1: c1{s1, s2, s3} unreachable
+s2: c2{s1, s2, s3, s4} offline
+s3: c5{s3, s4, s5} Leader
+s4: c5{s3, s4, s5}
+s5: c5{s3, s4, s5}
+```
 
 Step 5: Administrator brings back s2 with a new disk and the same identity.
+```
 s1: c1{s1, s2, s3 } unreachable
 s2: {}
 s3: c5{s3, s4, s5 } Leader
 s4: c5{s3, s4, s5 }
 s5: c5{s3, s4, s5 }
+```
 
 Step 6: s1 becomes reachable again and it starts an election. s2 votes for s1 and s2 still being on the first configuration has a majority and becomes leader. s1 replicates
 to s2 and s2 truncates it log, assuming configuration c1.
-s1: c1{s1, s2, s3 } Leader
-s2: c1{s1, s2, s3 }
-s3: c5{s3, s4, s5 } Leader
-s4: c5{s3, s4, s5 }
-s5: c5{s3, s4, s5 }
+```
+s1: c1{s1, s2, s3} Leader
+s2: c1{s1, s2, s3}
+s3: c5{s3, s4, s5} Leader
+s4: c5{s3, s4, s5}
+s5: c5{s3, s4, s5}
+```
