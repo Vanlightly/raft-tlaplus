@@ -84,7 +84,8 @@ CONSTANTS EqualTerm, LessOrEqualTerm
 
 \* Limiting state space by limiting the number of elections, restarts etc           
 CONSTANTS MaxElections, MaxRestarts, MaxValuesPerTerm,
-          MaxAddReconfigs, MaxRemoveReconfigs, MinClusterSize
+          MaxAddReconfigs, MaxRemoveReconfigs,
+          MinClusterSize, MaxClusterSize
 
 \* When TRUE, implements reconfiguration according to the thesis.
 \* When FALSE, uses the fix documented here: https://groups.google.com/g/raft-dev/c/t4xj6dJTP6E?spm=a2c65.11461447.0.0.72ff5798NIE11G
@@ -257,11 +258,13 @@ MostRecentReconfigEntry(serverLog) ==
     IN [index |-> index, entry |-> serverLog[index]]
 
 NoConfig == 
-    [members   |-> {},
+    [id        |-> 0,
+     members   |-> {},
      committed |-> FALSE]
               
 ConfigFor(index, reconfigEntry, ci) ==
-    [members   |-> reconfigEntry.value.members,
+    [id        |-> reconfigEntry.value.id,
+     members   |-> reconfigEntry.value.members,
      committed |-> ci >= index]
 
 \* Used in nextIndex to indicate snapshots should/have been sent
@@ -286,7 +289,8 @@ InitServerVars(leader, members) ==
     /\ votedFor    = [i \in Server |-> Nil]
     /\ config      = [i \in Server |->
                             IF i \in members
-                            THEN [members        |-> members,
+                            THEN [id             |-> 1,
+                                  members        |-> members,
                                   committed      |-> TRUE]
                             ELSE NoConfig]
     
@@ -323,7 +327,8 @@ Init == LET members    == CHOOSE s \in SUBSET Server :
             leader     == CHOOSE i \in members : TRUE
             firstEntry == [command |-> InitClusterCommand,
                            term    |-> 1,
-                           value   |-> [members |-> members]]
+                           value   |-> [id      |-> 1,
+                                        members |-> members]]
         IN
             /\ messages = [m \in {} |-> 0]
             /\ InitServerVars(leader, members)
@@ -698,13 +703,12 @@ RejectAppendEntriesRequest ==
 \* server assumes this new configuration immediately (even if it is not
 \* a member of the new configuration).   
 CanAppend(m, i) ==
-    /\ m.mentries /= << >>
+    /\ m.mentries # << >>
     /\ Len(log[i]) = m.mprevLogIndex
     
 NeedsTruncation(m, i, index) ==
-   /\ m.mentries /= << >>
+   /\ m.mentries # << >>
    /\ Len(log[i]) >= index
-   /\ log[i][index].term /= m.mentries[1].term
 
 TruncateLog(m, i) ==
     [index \in 1..m.mprevLogIndex |-> log[i][index]]
@@ -792,6 +796,7 @@ AppendAddServerCommandToLog(i) ==
     \* enabling conditions
     /\ state[i] = Leader
     /\ addReconfigCtr < MaxAddReconfigs
+    /\ Cardinality(config[i].members) < MaxClusterSize
     /\ ~HasPendingConfigCommand(i)
     /\ IF ~IncludeThesisBug
        THEN LeaderHasCommittedEntriesInCurrentTerm(i)
@@ -801,7 +806,8 @@ AppendAddServerCommandToLog(i) ==
         \* state changes
         /\ LET entry == [command |-> AddServerCommand,
                          term    |-> currentTerm[i],
-                         value   |-> [new     |-> addMember,
+                         value   |-> [id      |-> config[i].id + 1,
+                                      new     |-> addMember,
                                       members |-> config[i].members \union {addMember}]]
                newLog == Append(log[i], entry)
            IN  /\ log' = [log EXCEPT ![i] = newLog]
@@ -833,7 +839,8 @@ AppendRemoveServerCommandToLog(i) ==
         \* state changes
         /\ LET entry == [command |-> RemoveServerCommand,
                          term    |-> currentTerm[i],
-                         value   |-> [old     |-> removeMember,
+                         value   |-> [id      |-> config[i].id + 1,
+                                      old     |-> removeMember,
                                       members |-> config[i].members \ {removeMember}]] 
                newLog == Append(log[i], entry)
            IN  /\ log' = [log EXCEPT ![i] = newLog]
@@ -955,7 +962,7 @@ Next ==
         \/ HandleSnapshotRequest
         \/ HandleSnapshotResponse
         \* uncomment to see invariant violations during reconfigurations
-\*        \/ \E i \in Server : ResetWithSameIdentity(i)
+        \/ \E i \in Server : ResetWithSameIdentity(i)
         
 \*        \/ \E m \in DOMAIN messages : DuplicateMessage(m)
 \*        \/ \E m \in DOMAIN messages : DropMessage(m)
