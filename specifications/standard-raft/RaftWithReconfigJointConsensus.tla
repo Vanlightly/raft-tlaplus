@@ -265,23 +265,27 @@ IsCurrentLeader(i) ==
         /\ currentTerm[l] > currentTerm[i]
 
 NoConfig == 
-    [jointConsensus |-> FALSE,
+    [id             |-> 0,
+     jointConsensus |-> FALSE,
      members        |-> {},
      committed      |-> FALSE]
        
 InitConfig(serverLog, ci) ==
-    [jointConsensus |-> FALSE,
+    [id             |-> serverLog[1].value.id,
+     jointConsensus |-> FALSE,
      members        |-> serverLog[1].value.members,
      committed      |-> ci >= 1]
               
 ConfigFor(index, reconfigEntry, ci) ==
     IF reconfigEntry.command = OldNewConfigCommand
-    THEN [jointConsensus |-> TRUE,
+    THEN [id             |-> reconfigEntry.value.id,
+          jointConsensus |-> TRUE,
           members        |-> reconfigEntry.value.members,
           old            |-> reconfigEntry.value.old,
           new            |-> reconfigEntry.value.new,
           committed      |-> ci >= index]
-    ELSE [jointConsensus |-> FALSE,
+    ELSE [id             |-> reconfigEntry.value.id,
+          jointConsensus |-> FALSE,
           members        |-> reconfigEntry.value.members,
           committed      |-> ci >= index]
 
@@ -301,7 +305,8 @@ InitServerVars(leader, members) ==
     /\ votedFor    = [i \in Server |-> Nil]
     /\ config      = [i \in Server |->
                             IF i \in members
-                            THEN [jointConsensus |-> FALSE,
+                            THEN [id             |-> 1,
+                                  jointConsensus |-> FALSE,
                                   members        |-> members,
                                   committed      |-> TRUE]
                             ELSE NoConfig]
@@ -332,12 +337,13 @@ InitAuxVars == /\ electionCtr = 0
                /\ acked = [v \in Value |-> Nil]
                /\ valueCtr = [v \in 1..MaxElections+1 |-> 0]
 
+\* This specification pre-installs a cluster
 Init == LET members    == CHOOSE s \in SUBSET Server :
                               Cardinality(s) = InitClusterSize
             leader     == CHOOSE i \in members : TRUE
             firstEntry == [command |-> NewConfigCommand,
                            term    |-> 1,
-                           value   |-> [id      |-> 0,
+                           value   |-> [id      |-> 1,
                                         members |-> members]]
         IN
             /\ messages = [m \in {} |-> 0]
@@ -652,10 +658,23 @@ AdvanceCommitIndex(i) ==
 \* - or the message entry is too high (beyond the last log entry + 1)
 \* - or the member is new and needs a snapshot instead
 LogOk(i, m) ==
-    \/ m.mprevLogIndex = 0
-    \/ /\ m.mprevLogIndex > 0
-       /\ m.mprevLogIndex <= Len(log[i])
-       /\ m.mprevLogTerm = log[i][m.mprevLogIndex].term
+    \* note that in this spec, the log cannot be empty as it is seeded
+    \* with an NewConfigCommand. So an empty AppendEntries does not
+    \* mean the log is empty, only that the follower is caught up.
+    
+    \* an non-empty AppendEntries can be an append or a truncate scenario.
+    \* It will append when m.mprevLogIndex = Len(log[i])
+    \* It will truncate when m.mprevLogIndex < Len(log[i])
+    IF m.mentries # <<>>
+    THEN /\ m.mprevLogIndex > 0
+         /\ m.mprevLogIndex <= Len(log[i])
+         /\ m.mprevLogTerm = log[i][m.mprevLogIndex].term
+    ELSE
+         \* if its an empty RPC then the mprevLogIndex should line-up
+         \* perfectly with the end of the log.
+         /\ m.mentries = <<>>
+         /\ m.mprevLogIndex = Len(log[i])
+         /\ m.mprevLogTerm = log[i][m.mprevLogIndex].term
 
 RejectAppendEntriesRequest ==
     \* enabling conditions
@@ -700,7 +719,6 @@ CanAppend(m, i) ==
 NeedsTruncation(m, i, index) ==
    /\ m.mentries /= << >>
    /\ Len(log[i]) >= index
-   /\ log[i][index].term /= m.mentries[1].term
 
 TruncateLog(m, i) ==
     [index \in 1..m.mprevLogIndex |-> log[i][index]]
@@ -1001,7 +1019,6 @@ LivenessSpec == Init /\ [][Next]_vars /\ NoStuttering
 \* with no leader and all elections used up.
 OldNewCommitted(i, index) ==
     /\ log[i][index].command = OldNewConfigCommand
-\*  /\ log[i][index].term = 1
     /\ commitIndex[i] >= index
 
 NewConfigReachesMajority(i, index) ==
