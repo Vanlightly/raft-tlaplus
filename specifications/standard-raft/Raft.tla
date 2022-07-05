@@ -100,8 +100,11 @@ VARIABLE nextIndex
 \* The latest entry that each follower has acknowledged is the same as the
 \* leader's. This is used to calculate commitIndex on the leader.
 VARIABLE matchIndex
-
-leaderVars == <<nextIndex, matchIndex>>
+\* Tracks which peers a leader is waiting on a response for.
+\* Used for one-at-a-time AppendEntries RPCs. Not really required but
+\* permitting out of order requests explodes the state space.
+VARIABLE pendingResponse
+leaderVars == <<nextIndex, matchIndex, pendingResponse>>
 
 \* End of per server variables.
 ----
@@ -200,8 +203,9 @@ InitCandidateVars == votesGranted   = [i \in Server |-> {}]
 \* in the functions.
 InitLeaderVars == /\ nextIndex  = [i \in Server |-> [j \in Server |-> 1]]
                   /\ matchIndex = [i \in Server |-> [j \in Server |-> 0]]
-InitLogVars == /\ log          = [i \in Server |-> << >>]
-               /\ commitIndex  = [i \in Server |-> 0]
+InitLogVars == /\ log             = [i \in Server |-> << >>]
+               /\ commitIndex     = [i \in Server |-> 0]
+               /\ pendingResponse = [i \in Server |-> [j \in Server |-> FALSE]]
 InitAuxVars == /\ electionCtr = 0
                /\ restartCtr = 0
                /\ acked = [v \in Value |-> Nil]
@@ -221,12 +225,13 @@ Init == /\ messages = [m \in {} |-> 0]
 \* It loses everything but its currentTerm, votedFor and log.
 Restart(i) ==
     /\ restartCtr < MaxRestarts
-    /\ state'          = [state EXCEPT ![i] = Follower]
-    /\ votesGranted'   = [votesGranted EXCEPT ![i] = {}]
-    /\ nextIndex'      = [nextIndex EXCEPT ![i] = [j \in Server |-> 1]]
-    /\ matchIndex'     = [matchIndex EXCEPT ![i] = [j \in Server |-> 0]]
-    /\ commitIndex'    = [commitIndex EXCEPT ![i] = 0]
-    /\ restartCtr'     = restartCtr + 1
+    /\ state'           = [state EXCEPT ![i] = Follower]
+    /\ votesGranted'    = [votesGranted EXCEPT ![i] = {}]
+    /\ nextIndex'       = [nextIndex EXCEPT ![i] = [j \in Server |-> 1]]
+    /\ matchIndex'      = [matchIndex EXCEPT ![i] = [j \in Server |-> 0]]
+    /\ pendingResponse' = [pendingResponse EXCEPT ![i] = [j \in Server |-> FALSE]]
+    /\ commitIndex'     = [commitIndex EXCEPT ![i] = 0]
+    /\ restartCtr'      = restartCtr + 1
     /\ UNCHANGED <<messages, currentTerm, votedFor, log, acked, electionCtr>>
 
 \* ACTION: RequestVote
@@ -258,6 +263,7 @@ RequestVote(i) ==
 AppendEntries(i, j) ==
     /\ i /= j
     /\ state[i] = Leader
+    /\ pendingResponse[i][j] = FALSE \* not already waiting for a response
     /\ LET prevLogIndex == nextIndex[i][j] - 1
            prevLogTerm == IF prevLogIndex > 0 THEN
                               log[i][prevLogIndex].term
@@ -267,15 +273,16 @@ AppendEntries(i, j) ==
            lastEntry == Min({Len(log[i]), nextIndex[i][j]})
            entries == SubSeq(log[i], nextIndex[i][j], lastEntry)
        IN 
-          Send([mtype          |-> AppendEntriesRequest,
-                mterm          |-> currentTerm[i],
-                mprevLogIndex  |-> prevLogIndex,
-                mprevLogTerm   |-> prevLogTerm,
-                mentries       |-> entries,
-                mcommitIndex   |-> Min({commitIndex[i], lastEntry}),
-                msource        |-> i,
-                mdest          |-> j])
-    /\ UNCHANGED <<serverVars, candidateVars, leaderVars, logVars, auxVars>>
+          /\ pendingResponse' = [pendingResponse EXCEPT ![i][j] = TRUE]
+          /\ Send([mtype          |-> AppendEntriesRequest,
+                   mterm          |-> currentTerm[i],
+                   mprevLogIndex  |-> prevLogIndex,
+                   mprevLogTerm   |-> prevLogTerm,
+                   mentries       |-> entries,
+                   mcommitIndex   |-> Min({commitIndex[i], lastEntry}),
+                   msource        |-> i,
+                   mdest          |-> j])
+    /\ UNCHANGED <<serverVars, candidateVars, nextIndex, matchIndex, logVars, auxVars>>
 
 \* ACTION: BecomeLeader -------------------------------------------
 \* Candidate i transitions to leader.
@@ -287,6 +294,8 @@ BecomeLeader(i) ==
                          [j \in Server |-> Len(log[i]) + 1]]
     /\ matchIndex' = [matchIndex EXCEPT ![i] =
                          [j \in Server |-> 0]]
+    /\ pendingResponse' = [pendingResponse EXCEPT ![i] =
+                                [j \in Server |-> FALSE]]
     /\ UNCHANGED <<messages, currentTerm, votedFor, candidateVars, 
                    auxVars, logVars>>
 
@@ -332,7 +341,7 @@ AdvanceCommitIndex(i) ==
                         THEN v \in { log[i][index].value : index \in commitIndex[i]+1..newCommitIndex }
                         ELSE acked[v]]
     /\ UNCHANGED <<messages, serverVars, candidateVars, leaderVars, log, 
-                   electionCtr, restartCtr>>
+                   pendingResponse, electionCtr, restartCtr>>
 
 \* ACTION: UpdateTerm
 \* Any RPC with a newer term causes the recipient to advance its term first.
@@ -430,9 +439,14 @@ CanAppend(m, i) ==
     /\ m.mentries /= << >>
     /\ Len(log[i]) = m.mprevLogIndex
     
+\* truncate in two cases:
+\* - the last log entry index is >= than the entry being received
+\* - this is an empty RPC and the last log entry index is > than the previous log entry received
 NeedsTruncation(m, i, index) ==
-   /\ m.mentries /= << >>
-   /\ Len(log[i]) >= index
+   \/ /\ m.mentries /= <<>>
+      /\ Len(log[i]) >= index
+   \/ /\ m.mentries = <<>>
+      /\ Len(log[i]) > m.mprevLogIndex
 
 TruncateLog(m, i) ==
     [index \in 1..m.mprevLogIndex |-> log[i][index]]
@@ -447,11 +461,13 @@ AcceptAppendEntriesRequest ==
            IN 
               /\ state[i] \in { Follower, Candidate }
               /\ logOk
-              /\ LET new_log == IF CanAppend(m, i)
-                                THEN [log EXCEPT ![i] = Append(log[i], m.mentries[1])]
-                                ELSE IF NeedsTruncation(m, i , index)
-                                     THEN [log EXCEPT ![i] = Append(TruncateLog(m, i), m.mentries[1])]
-                                     ELSE log 
+              /\ LET new_log == CASE CanAppend(m, i) ->
+                                        [log EXCEPT ![i] = Append(log[i], m.mentries[1])]
+                                  [] NeedsTruncation(m, i , index) /\ m.mentries # <<>> ->
+                                        [log EXCEPT ![i] = Append(TruncateLog(m, i), m.mentries[1])]
+                                  [] NeedsTruncation(m, i , index) /\ m.mentries = <<>> ->
+                                        [log EXCEPT ![i] = TruncateLog(m, i)]
+                                  [] OTHER -> log 
                  IN
                     /\ state' = [state EXCEPT ![i] = Follower]
                     /\ commitIndex' = [commitIndex EXCEPT ![i] =
@@ -484,6 +500,7 @@ HandleAppendEntriesResponse ==
                     /\ nextIndex' = [nextIndex EXCEPT ![i][j] =
                                          Max({nextIndex[i][j] - 1, 1})]
                     /\ UNCHANGED <<matchIndex>>
+              /\ pendingResponse' = [pendingResponse EXCEPT ![i][j] = FALSE]
               /\ Discard(m)
               /\ UNCHANGED <<serverVars, candidateVars, logVars, auxVars>>
 
@@ -535,15 +552,28 @@ LivenessSpec == Init /\ [][Next]_vars /\ NoStuttering
 ----
 \* LIVENESS   -------------------------
 
-\* Liveness: AllEntriesReplicated
-\* Only use this when MaxElections = 1 and in odd-sized clusters
-\* given that the one permitted election may not succeed
-AllEntriesReplicated ==
-    []<>(\A v \in Value : 
-            \A s \in Server : 
-                \E index \in DOMAIN log[s] :
-                    log[s][index].value = v) 
+\* ValuesNotStuck -----------------
+\* A client value will either get committed and be
+\* fully replicated or it will be truncated and
+\* not be found on any server log.
+\* Note that due to the number of elections being limited,
+\* the last possible election could fail and prevent
+\* progress, so this liveness formula only apples in cases
+\* a behaviour does not end with all elections used up
+\* and no elected leader.
+ValueInServerLog(i, v) ==
+    \E index \in DOMAIN log[i] :
+        log[i][index].value = v
 
+ValueAllOrNothing(v) ==
+    IF /\ electionCtr = MaxElections
+       /\ ~\E i \in Server : state[i] = Leader
+    THEN TRUE
+    ELSE \/ \A i \in Server : ValueInServerLog(i, v)
+         \/ ~\E i \in Server : ValueInServerLog(i, v)
+
+ValuesNotStuck ==
+    \A v \in Value : []<>ValueAllOrNothing(v)
 
 \* INVARIANTS -------------------------
 
