@@ -1234,7 +1234,7 @@ AcceptJoinRequest ==
                              currentEpoch, state, leader, votedFor, pendingFetch,
                              highWatermark, auxVars>>  
 
-\* ACTION: AcceptJoinRequest ----------------------------------
+\* ACTION: HandleLeaveRequest ----------------------------------
 \* Leader i accepts a valid LeaveRequest and
 \* appends a RemoveServerCommand, with identity of the server to remove, 
 \* to its log and assumes the new configuration immediately.
