@@ -111,9 +111,36 @@ this specification reverses the order by making a joinee catch-up first and
 then adding the reconfig command once it has done so. This makes for a simpler
 design.
 
-In order to add a server, the server itself must request to join the cluster.
-It does so with the following sequence:
+In Kafka KRaft terms the joinee can simply be fetching as an observer until
+it has caught up and then issue the JoinRequest. However, to reduce the state space
+this spec uses a snapshot to catch up, via a PrepareJoinRequest.
 
+In order to add a server, the server itself must request to join the cluster.
+It does so with the following sequence.
+
+The implementation may do the following:
+
+===================
+Joinee server                               Leader
+  |                                           |
+  ----Fetch as an observer------------------->
+  ...
+(caught up to the leader)  
+  ----JoinRequest(identity)------------------>
+                                       (append AddServerCommand to log)
+  <---JoinResponse{ok}------------------------
+  ----Fetch as an observer------------------->
+  ...
+(receives the AddServerCommand and switches to this configuration)
+  ----Fetch as voter ------------------------>
+  ...  
+===================
+
+This TLA+ specification however achieves the same via a different
+ultimately equivalent sequence which has fewer steps for a smaller 
+state space:
+
+===================
 Joinee server                               Leader
   |                                           |
   ----PrepareJoinRequest{identity}----------->
@@ -121,50 +148,41 @@ Joinee server                               Leader
 (apply snapshot - now caught up)
   ----JoinRequest(identity, config id)------->
                                        (append AddServerCommand to log)
-  <---JoinResponse{ok}------------------------
-
-The PrepareJoinResponse contains a snapshot and the current configuraton.
-The implementation would instead pass a snapshot id that the joinee would then request
-but that is ommitted from this specification.
-
-The JoinRequest includes the configuration id that was received by the joinee
-in the PrepareJoinResponse. 
+  <---JoinResponse{ok, missing log entries}---
+(switch to new configuration)
+  ----Fetch as voter ------------------------>
+  ...  
 
 To be valid a JoinRequest the following conditions are required:
 - request received by a leader
 - the joining node cannot already be a member
-- the config id in the request must match the current config id of the leader
+- the config id in the request must match the current 
+  config id of the leader (only this spec, not when using an observer).
 - the leader have no in-progress reconfiguration
 - the leader must have committed an offset in the current epoch.
 
 The JoinResponse is sent as soon as the AddServerCommand
-has been appended to the leader's log.
+has been appended to the leader's log. In this spec, it
+includes the remaining missing entries that the joinee doesn't have.
+In the implementation, these entries would be obtained by
+continuing to fetch as the observer.
 
-Further protecting liveness
-Between receiving a snapshot and sending the JoinRequest there
-may be a large number of new entries. This can still present
-a liveness challenge if this server would be required in order to make
-progress. So to avoid that the implementation can do the following:
-- Joinee includes its end offset in the JoinRequest
-- The leader can reject the request if the lag is too large.
-- After a snapshot, the joinee can continue to keep pace
-  with the leader by fetching as an observer.
-- The joinee can send a JoinRequest once it has caught up to
-  the leader and avoid being rejected for being too far behind.
+TODO: see if I can model this with observer and small state space
+to ensure implementation and spec match.
 
 Removing a member
 --------------------
-Requester                                   Leader
+Administrator                               Leader
    |                                          |
-   ----LeaveRequest--------------------------->
-                                          (add RemoveServerCommand to log)
-   <---LeaveResponse---------------------------                                       
+   ----RemoveRequest-------------------------->
+                                (add RemoveServerCommand to log)
+   <---RemoveResponse--------------------------                                       
 
 
-The LeaveResponse is sent as soon as the command has been
+The RemoveResponse is sent as soon as the command has been
 added to the leader's log.
 
-To be valid a LeaveRequest the following conditions are required:
+To be valid a RemoveRequest the following conditions are required:
 - request received by a leader
 - the leaving node must be a member of the current configuration
 - the leader have no in-progress reconfiguration
@@ -188,7 +206,11 @@ Additional nuance
   - participate in elections, this is because it may have 
     switched to a new configuration where it isn't a member
     but that configuration doesn't ultimately get committed.
-  - Accept a BeginQuorumRequest
+- A server cannot do the following if it does not believe it is
+  in the current configuration:
+  - Accept a BeginQuorumRequest, it must wait until it has joined the
+    configuration else it could become a leader and yet not be
+    a member.
 - Because servers immediately switch to new configurations,
   they must always be prepared to revert back to the prior
   configuration if the command of the current configuration
@@ -227,7 +249,7 @@ CONSTANTS RequestVoteRequest, RequestVoteResponse,
           EndQuorumRequest,
           FetchRequest, FetchResponse,
           PrepareJoinRequest, PrepareJoinResponse,
-          JoinRequest, LeaveRequest
+          JoinRequest
 
 \* Fetch response codes          
 CONSTANTS Ok, NotOk, Diverging, UnknownMember
@@ -843,6 +865,7 @@ HandleBeginQuorumRequest ==
                newState == MaybeTransition(i, m.msource, m.mepoch)
            IN IF error = Nil
               THEN
+                   /\ i \in config[i].members \* eventually it will accept such a request when it has joined the configuration
                    /\ state' = [state EXCEPT ![i] = newState.state]
                    /\ leader' = [leader EXCEPT ![i] = newState.leader]
                    /\ currentEpoch' = [currentEpoch EXCEPT ![i] = newState.epoch]
@@ -1256,36 +1279,38 @@ AcceptJoinRequest ==
                                                   highWatermark[i])]
                      \* start tracking the end offset of this new member
                      /\ endOffset' = [endOffset EXCEPT ![i] = @ @@ (addMember :> 0)]
-              /\ UNCHANGED <<servers, messages, candidateVars,
+                     /\ Discard(m)
+                     \* TODO send JoinResponse with missing entries
+              /\ UNCHANGED <<servers, candidateVars,
                              currentEpoch, state, leader, votedFor, pendingFetch,
                              highWatermark, auxVars>>  
 
-\* ACTION: HandleLeaveRequest ----------------------------------
-\* Leader i accepts a valid LeaveRequest and
+\* ACTION: HandleRemoveRequest ----------------------------------
+\* Leader i accepts a valid RemoveRequest from an Administrator and
 \* appends a RemoveServerCommand, with identity of the server to remove, 
 \* to its log and assumes the new configuration immediately.
-\* To be valid a LeaveRequest the following conditions are required:
+\* To be valid a RemoveRequest the following conditions are required:
 \* - request received by a leader
 \* - the leaving node must be a member of the current configuration
 \* - the leader have no in-progress reconfiguration
 \* - the leader must have committed an offset in the current epoch.
-LeaveCheck(i, j) ==
+RemoveCheck(i, j) ==
     CASE state[i] # Leader -> NotLeader
       [] j \in config[i].members -> "UnknownMember"
       [] HasPendingConfigCommand(i) -> "PendingReconfig"
       [] ~LeaderHasCommittedOffsetsInCurrentEpoch(i) -> "LeaderNotReady"
       [] OTHER -> Ok
 
-HandleLeaveRequest ==
-    \E i, leaver \in servers :
-        /\ LeaveCheck(i, leaver) = Ok
+HandleRemoveRequest ==
+    \E i, removeServer \in servers :
+        /\ RemoveCheck(i, removeServer) = Ok
         /\ Cardinality(config[i].members) > MinClusterSize
         \* state changes
         /\ LET entry        == [command |-> RemoveServerCommand,
                                 epoch   |-> currentEpoch[i],
                                 value   |-> [id      |-> config[i].id + 1,
-                                             old     |-> leaver,
-                                             members |-> config[i].members \ {leaver}]]
+                                             old     |-> removeServer,
+                                             members |-> config[i].members \ {removeServer}]]
                newLog    == Append(log[i], entry)
            IN  /\ log' = [log EXCEPT ![i] = newLog]
                /\ config' = [config EXCEPT ![i] = 
@@ -1325,7 +1350,7 @@ Next ==
         \/ AcceptPrepareJoinRequest
         \/ HandlePrepareJoinResponse
         \/ AcceptJoinRequest
-        \/ HandleLeaveRequest
+        \/ HandleRemoveRequest
         
 \*        \/ \E m \in DOMAIN messages : DuplicateMessage(m)
 \*        \/ \E m \in DOMAIN messages : DropMessage(m)
@@ -1396,7 +1421,18 @@ NoLogDivergence ==
 
 \* INV: Used in debugging
 TestInv ==
-    TRUE
+    \A i \in servers :
+        IF \E offset \in DOMAIN log[i] :
+            /\ log[i][offset].command = AddServerCommand
+            /\ highWatermark[i] >= offset
+        THEN FALSE
+\*            IF \E offset \in DOMAIN log[i] :
+\*                /\ log[i][offset].command = RemoveServerCommand
+\*                /\ highWatermark[i] >= offset
+\*            THEN FALSE
+\*            ELSE TRUE
+        ELSE TRUE
+        
 
 \* INV: NeverTwoLeadersInSameEpoch
 \* We cannot have two servers having a conflicting
