@@ -30,6 +30,9 @@ which is required for leaders to be able to give followers the information they 
 to truncate their logs. This specification does not model this cache but simply looks up this
 information from the log itself.
 
+------------------------------------------------
+Transitions
+
 State transitions (taken from https://github.com/apache/kafka/blob/trunk/raft/src/main/java/org/apache/kafka/raft/QuorumState.java):
 * Unattached|Resigned transitions to:
  *    Unattached: After learning of a new election with a higher epoch
@@ -54,9 +57,32 @@ State transitions (taken from https://github.com/apache/kafka/blob/trunk/raft/sr
  *    Unattached: After learning of a new election with a higher epoch
  *    Candidate: After expiration of the fetch timeout
  *    Follower: After discovering a leader with a larger epoch
+ 
+------------------------------------------------ 
+Server identity 
 
---------------------------------
-Reconfiguration ----------------
+A server's identity is a composite of the host and a randomly
+generated disk id. The purpose of this randomly generated
+component is to avoid a server from participating
+in the cluster after being restarted without its state
+such as after a disk failure or volume mount misconfiguration.
+
+When a server starts without state it generates a fresh identity.
+If it previously had state and a prior identity, this new identity
+will not match and so the peer servers will not consider it
+the same server and will not accept requests from it.
+
+The only way to add a server with a new identity to the cluster
+is via reconfiguration.
+
+This specification uses a global counter to produce diskIds 
+but an implementation would use a UUID. 
+
+Each server uses a record like the following as its identity:
+[host |-> s1, diskId |-> 7]
+
+------------------------------------------------
+Reconfiguration 
 
 KRaft implements the one-at-a-time add or remove member reconfiguration
 algorithm instead of the Joint Consensus algorithm. This restricts
