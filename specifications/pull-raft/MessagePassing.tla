@@ -4,7 +4,7 @@ EXTENDS Integers, Naturals, FiniteSets, Sequences, TLC
 
 \* Message types:
 CONSTANTS RequestVoteRequest, RequestVoteResponse,
-          BeginQuorumRequest, BeginQuorumResponse,
+          BeginQuorumRequest,
           FetchRequest, FetchResponse,
           JoinRequest, JoinResponse
 
@@ -78,8 +78,12 @@ Reply(response, request) ==
           /\ messages' = [messages EXCEPT ![request] = @ - 1,
                                           ![response] = @ + 1]
 
+MessagesAreValid ==
+    ~\E m \in DOMAIN messages :
+        m.mdest = m.msource
+
 =============================================================================
 \* Modification History
-\* Last modified Sat Jul 16 11:19:49 CEST 2022 by GUNMETAL
+\* Last modified Sun Jul 17 13:07:27 CEST 2022 by GUNMETAL
 \* Last modified Sat Jul 16 11:14:02 CEST 2022 by jvanlightly
 \* Created Sat Jul 16 11:13:38 CEST 2022 by jvanlightly

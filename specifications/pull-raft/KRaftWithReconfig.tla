@@ -11,7 +11,7 @@ Kafka KRaft TLA+ specification
 This is a specification that is a mix of reverse engineering the
 existing Kafka KRaft implementation (as of v3.2.0) plus the addition 
 of reconfiguration and composite server identity which is at the time
-of this writing being designed by myself and the Kafka core team at
+of this writing being designed by myself and Kafka engineering at
 Confluent.
 
 This spec makes some effort to reuse some of the functions of the 
@@ -26,7 +26,7 @@ Note the following messages are not modelled:
   in the specification, message retries are implicit and so explicit retries
   are not required.
 - EndQuorumRequest/Response as this exists as an optimization for a leader
-  that gracefully shutsdown or has been removed from the congifuration. 
+  that gracefully shutsdown or has been removed from the configuration. 
   It is not needed for correctness and so is not included.
 - FetchSnapshotRequest/Response. This is a straight forward optimization
   and so has not been explicitly modelled. 
@@ -75,8 +75,10 @@ State transitions (taken from https://github.com/apache/kafka/blob/trunk/raft/sr
  *    Candidate: After expiration of the fetch timeout
  *    Follower: After discovering a leader with a larger epoch
  
+Note that resigned is not modeled in this spec. 
+ 
 ------------------------------------------------ 
-Server identity - targeted for v3.3
+Server identity - targeted for a future version
 
 A server's identity is a composite of the host and a randomly
 generated disk id. The purpose of this randomly generated
@@ -99,7 +101,7 @@ Each server uses a record like the following as its identity:
 [host |-> s1, diskId |-> 7]
 
 ------------------------------------------------
-Reconfiguration - targeted for v3.3
+Reconfiguration - targeted for a future version
 
 KRaft implements the one-at-a-time add or remove member 
 reconfiguration algorithm instead of the Joint Consensus
@@ -133,22 +135,29 @@ catch-up first as an observer and then once it has done so,
 allow it to send a JoinRequest to the leader who will add 
 an AddServerCommand to its log. This makes for a simpler design.
 
-Join sequence is the following:
+An administrator will issue a command to the server to join
+the cluster as a voter. From there the server will do 
+what is necessary:
 
 ===================
 Joinee server                               Leader
-  |                                           |  
-  ----Fetch as an observer------------------->
-  ...
-(caught up to the leader)  
-  ----JoinRequest(identity)------------------>
-                                       (append AddServerCommand to log)
-  <---JoinResponse{ok}------------------------
-  ----Fetch as an observer------------------->
-  ...
-(receives the AddServerCommand and switches to this configuration)
-  ----Fetch as voter ------------------------>
-  ...  
+  |                                           |
+(administrator tells server                   |
+ to join cluster)                             |
+  |                                           |
+  |---Fetch as an observer------------------->|
+  ...                                         |
+(caught up to the leader)                     |
+  |---JoinRequest(identity)------------------>|
+  |                                     (append AddServerCommand to log)
+  |<---JoinResponse{ok}-----------------------|
+  |---Fetch as an observer------------------->|
+  ...                                         |
+(receives the AddServerCommand 
+ and switches to this configuration 
+ as a voter)
+  |---Fetch as voter ------------------------>|
+  |                                           |
 ===================
 
 To be valid a JoinRequest the following conditions are required:
@@ -166,20 +175,19 @@ as an observer until it receives the AddServerCommand. Once
 received it immediately assumes the configuration, becoming a Voter
 follower.
 
-If the joinee doesn't receive the command after a timeout time period it can resend
-the join request.
+If the joinee doesn't receive the command after a timeout time period 
+it can resend the join request.
 
 In the case of a reject response, it depends on the error:
 - NotLeader: If the response contains the real leader the joinee
              then sends a JoinRequest to that server.
              If the response contains no leader id then the joinee will
              revert to Unattached and start fetching from voters
-             at random until it discovers the real leadeer and can then
+             at random until it discovers the real leader and can then
              send it a join request.
 - AlreadyMember: treats it as a success response.
 - LeaderNotReady: waits a while and retries the join request
 - ReconfigInProgress: waits a while and retries the join request
-
 
 Removing a member
 --------------------
@@ -188,9 +196,9 @@ leader, including the identity of the server to be removed.
 
 Administrator                               Leader
    |                                          |
-   ----RemoveRequest-------------------------->
-                                (add RemoveServerCommand to log)
-   <---RemoveResponse--------------------------                                       
+   |---RemoveRequest------------------------->|
+   |                            (add RemoveServerCommand to log)
+   |<---RemoveResponse------------------------|                                       
 
 To be valid a RemoveRequest the following conditions are required:
 - request received by a leader (NotLeader error)
@@ -204,9 +212,14 @@ To be valid a RemoveRequest the following conditions are required:
 The RemoveResponse is sent immediately (does not 
 wait for the command to be committed) and is 
 either a success response as the request met 
-the conditions or a rejection. In the case of a 
-rejection the Administrator can decide whether
-to wait or issue the command again.
+the conditions or a rejection. In the case of
+a success response the administrator will need
+to somehow track progress of the operation. There
+is no guarantee it will get added as a leader 
+election or not enough servers being up might
+prevent it. In the case of a rejection the 
+Administrator can decide whether to wait or 
+issue the command again. 
 
 A leader may have appended a RemoveServerCommand 
 to its log where it is the server being removed. 
@@ -218,7 +231,7 @@ where it is no longer a voter and:
 While it is a non-voter leader it does not include 
 itself in the quorum for advancing the high watermark.
 As soon as the command is committed the server resigns 
-from leadership - becomes an regular observer.
+from leadership - becomes a regular observer.
 
 Also very importantly, a voter follower that switches to
 the new configuration where the leader is no longer
@@ -235,6 +248,22 @@ situation where we have:
 - voter followers fetching from an observer.
 But as counterintuitive as this seems, it satisfies
 both safety and liveness properties.
+
+In the case that the server that was removed from the 
+configuration is not the leader, we also have a slightly 
+counterintuitive situation in that we allow fetches from
+followers that consider themselves voters but which are 
+not in the the current configuration of the leader. This 
+can happen because the follower has still not reached the 
+reconfiguration command that removes it. Once the follower 
+does receive it, it will switch to being an observer. 
+Critically, this follower may be required in order to 
+commit the command, so if the leader did reject fetches 
+from this follower then it might block further progress 
+completely, resulting in a stuck cluster. This specification 
+can demonstrate this liveness property violation if you 
+tweak the logic to reject fetches from voters who are not 
+in the leader's current configuration.
 
 Additional reconfiguration nuance
 --------------------------------
@@ -282,7 +311,7 @@ CONSTANTS Value
 CONSTANTS Voter, Observer
 
 \* Server states.
-CONSTANTS Follower, Candidate, Leader, Unattached, Voted, Dead
+CONSTANTS Follower, Candidate, Leader, Unattached, Voted, DeadNoState
 
 \* Commands
 CONSTANTS AppendCommand,        \* contains a client value
@@ -304,9 +333,12 @@ CONSTANTS UnknownMember, AlreadyMember, ReconfigInProgress, LeaderNotReady,
 CONSTANTS IllegalState       
 
 \* Limiting state space by limiting the number of elections and restarts           
-CONSTANTS MaxElections, MaxRestarts,
-          MaxAddReconfigs, MaxRemoveReconfigs,
-          MaxTotalServers \* the maximum number of servers ever started
+CONSTANTS MaxElections,
+          MaxValuesPerEpoch, 
+          MaxRestarts,
+          MaxAddReconfigs, 
+          MaxRemoveReconfigs,
+          MaxSpawnedServers \* the maximum number of servers ever started
 ----
 \* Global variables
 
@@ -362,11 +394,11 @@ leaderVars == <<endOffset>>
 \* detect data loss.
 VARIABLE acked
 \* Counter for elections and restarts (to control state space)
-VARIABLE electionCtr, restartCtr, addReconfigCtr, removeReconfigCtr
+VARIABLE electionCtr, valueCtr, restartCtr, addReconfigCtr, removeReconfigCtr
 \* A counter used to generate a unique disk id. An implementation would
 \* use a random UUID but this spec uses a global counter for simplicity.
 VARIABLE diskIdGen
-auxVars == <<acked, electionCtr, restartCtr, addReconfigCtr, removeReconfigCtr, diskIdGen>>
+auxVars == <<acked, electionCtr, valueCtr, restartCtr, addReconfigCtr, removeReconfigCtr, diskIdGen>>
 ----
 \* All variables; used for stuttering (asserting state hasn't changed).
 vars == <<servers, messages, serverVars, candidateVars, leaderVars, logVars,
@@ -382,7 +414,7 @@ symmValues == Permutations(Value)
 \* The message is of the type and has a matching epoch.
 ReceivableMessage(m, mtype, epoch_match) ==
     /\ messages[m] > 0
-    /\ state[m.mdest] # Dead
+    /\ state[m.mdest] # DeadNoState
     /\ m.mtype = mtype
     /\ \/ epoch_match = AnyEpoch
        \/ /\ epoch_match = EqualEpoch
@@ -506,26 +538,41 @@ HasConsistentLeader(i, leaderId, epoch) ==
          \/ leader[i] = leaderId
 
 SetIllegalState ==
-    [state |-> IllegalState, epoch |-> 0, leader |-> Nil]
+    [state        |-> IllegalState,
+     epoch        |-> 0, 
+     leader       |-> Nil,
+     transitioned |-> TRUE]
 
 NoTransition(i) ==
-    [state |-> state[i], epoch |-> currentEpoch[i], leader |-> leader[i]]
+    [state        |-> state[i], 
+     epoch        |-> currentEpoch[i], 
+     leader       |-> leader[i],
+     transitioned |-> FALSE]
 
 TransitionToVoted(i, epoch, state0) ==
     IF /\ state0.epoch = epoch
        /\ state0.state # Unattached
     THEN SetIllegalState
-    ELSE [state |-> Voted, epoch |-> epoch, leader |-> Nil]
+    ELSE [state        |-> Voted,
+          epoch        |-> epoch,
+          leader       |-> Nil,
+          transitioned |-> TRUE]
 
 TransitionToUnattached(epoch) ==
-    [state |-> Unattached, epoch |-> epoch, leader |-> Nil]
+    [state        |-> Unattached, 
+     epoch        |-> epoch, 
+     leader       |-> Nil,
+     transitioned |-> TRUE]
     
 TransitionToFollower(i, leaderId, epoch) ==
     IF /\ currentEpoch[i] = epoch
        /\ \/ state[i] = Follower
           \/ state[i] = Leader
     THEN SetIllegalState
-    ELSE [state |-> Follower, epoch |-> epoch, leader |-> leaderId]
+    ELSE [state        |-> Follower, 
+          epoch        |-> epoch, 
+          leader       |-> leaderId,
+          transitioned |-> TRUE]
     
 MaybeTransition(i, leaderId, epoch) ==
     CASE ~HasConsistentLeader(i, leaderId, epoch) ->
@@ -546,6 +593,12 @@ MaybeTransition(i, leaderId, epoch) ==
             \* the request contained a leader id and this node does not know
             \* of a leader, so become a follower of that leader
             TransitionToFollower(i, leaderId, epoch)
+\*      []  /\ epoch = currentEpoch[i]
+\*          /\ leaderId = Nil  \* request does not contain a leader 
+\*          /\ leader[i] # Nil \* this server think it knows who the leader is
+\*                          ->
+\*            \* the leader of this epoch must have resigned
+\*            TransitionToUnattached(epoch)
       [] OTHER ->
             \* no changes
             NoTransition(i)
@@ -553,27 +606,36 @@ MaybeTransition(i, leaderId, epoch) ==
 MaybeHandleCommonResponse(i, leaderId, epoch, errors) ==
     CASE epoch < currentEpoch[i] ->
                 \* stale epoch, do nothing
-                [state |-> state[i],
-                 epoch |-> currentEpoch[i],
-                 leader |-> leader[i],
-                 handled |-> TRUE]
-      [] epoch > currentEpoch[i] \/ errors # Nil ->
+                [state        |-> state[i],
+                 epoch        |-> currentEpoch[i],
+                 leader       |-> leader[i],
+                 transitioned |-> FALSE,
+                 handled      |-> TRUE,
+                 error        |-> errors]
+      [] \/ epoch > currentEpoch[i] 
+         \/ errors \in { FencedLeaderEpoch, NotLeader } ->
                 \* higher epoch or an error
-                MaybeTransition(i, leaderId, epoch) @@ [handled |-> TRUE]
+                MaybeTransition(i, leaderId, epoch) @@ 
+                    [handled |-> TRUE, 
+                     error   |-> errors]
       [] /\ epoch = currentEpoch[i]
          /\ leaderId # Nil
          /\ leader[i] = Nil ->
                 \* become a follower
-                [state   |-> Follower, 
-                 leader  |-> leaderId,
-                 epoch   |-> currentEpoch[i],
-                 handled |-> TRUE]
+                [state        |-> Follower, 
+                 leader       |-> leaderId,
+                 epoch        |-> currentEpoch[i],
+                 transitioned |-> TRUE,
+                 handled      |-> errors # Nil,
+                 error        |-> errors]
       [] OTHER -> 
                 \* no changes to state or leadership
-                [state   |-> state[i],
-                 epoch   |-> currentEpoch[i], 
-                 leader  |-> leader[i],
-                 handled |-> FALSE]
+                [state        |-> state[i],
+                 epoch        |-> currentEpoch[i], 
+                 leader       |-> leader[i],
+                 transitioned |-> FALSE,
+                 handled      |-> FALSE,
+                 error        |-> errors]
 
 \* the offset points to a reconfiguration command in the log
 IsConfigCommand(serverLog, offset) ==
@@ -610,26 +672,25 @@ ConfigFor(offset, reconfigEntry, ci) ==
 \* then switch to the last configuration in the log.
 \* This may be assuming a new configuration or
 \* reverting to the prior configuration.  
-MaybeSwitchConfigurations(i, currConfig) ==
-    IF config[i].id = currConfig.id
-    THEN UNCHANGED << config, role, state, endOffset>>
-    ELSE
-         /\ config' = [config EXCEPT ![i] = currConfig]
-         /\ CASE role[i] = Voter /\ i \notin currConfig.members ->
-                    /\ role'  = [role EXCEPT ![i] = Observer]
-                    /\ state' = [state EXCEPT ![i] = Follower]
-              [] role[i] = Observer /\ i \in currConfig.members ->
-                    /\ role'  = [role EXCEPT ![i] = Voter]
-                    /\ state' = [state EXCEPT ![i] = Follower]
-              [] OTHER -> 
-                    UNCHANGED << role, state >>
-         \* ensure all members are in the endOffset map
-         \* this is just so the model checker doesn't barf later
-         /\ endOffset' = [endOffset EXCEPT ![i] =
-                            [j \in servers |-> 
-                                IF j \in DOMAIN endOffset[i]
-                                THEN endOffset[i][j]
-                                ELSE 0]]    
+MaybeSwitchConfigurations(i, currConfig, newState) ==
+     /\ leader' = [leader EXCEPT ![i] = newState.leader]
+     /\ config' = [config EXCEPT ![i] = currConfig]
+     /\ CASE role[i] = Voter /\ i \notin currConfig.members ->
+                /\ role'  = [role EXCEPT ![i] = Observer]
+                /\ state' = [state EXCEPT ![i] = Follower]
+          [] role[i] = Observer /\ i \in currConfig.members ->
+                /\ role'  = [role EXCEPT ![i] = Voter]
+                /\ state' = [state EXCEPT ![i] = Follower]
+          [] OTHER -> 
+                /\ state' = [state EXCEPT ![i] = newState.state]
+                /\ UNCHANGED role
+     \* ensure all members are in the endOffset map
+     \* this is just so the model checker doesn't barf later
+     /\ endOffset' = [endOffset EXCEPT ![i] =
+                        [j \in servers |-> 
+                            IF j \in DOMAIN endOffset[i]
+                            THEN endOffset[i][j]
+                            ELSE 0]]                                    
 
 LeaderHasCommittedOffsetsInCurrentEpoch(i) ==
     \E offset \in DOMAIN log[i] :
@@ -640,10 +701,10 @@ SetStateOfNewAndDeadIdentity(newIdentity, firstFetch, deadIdentity) ==
     /\ servers'         = servers \union {newIdentity}
     /\ config'          = config @@ (newIdentity :> NoConfig)
     /\ role'            = IF deadIdentity # Nil
-                          THEN [role EXCEPT ![deadIdentity] = Dead] @@ (newIdentity :> Observer)
+                          THEN [role EXCEPT ![deadIdentity] = DeadNoState] @@ (newIdentity :> Observer)
                           ELSE role @@ (newIdentity :> Observer)    
     /\ state'           = IF deadIdentity # Nil
-                          THEN [state EXCEPT ![deadIdentity] = Dead] @@ (newIdentity :> Unattached)
+                          THEN [state EXCEPT ![deadIdentity] = DeadNoState] @@ (newIdentity :> Unattached)
                           ELSE state @@ (newIdentity :> Unattached)
     /\ currentEpoch'    = currentEpoch @@ (newIdentity :> 0)
     /\ leader'          = leader @@ (newIdentity :> Nil)
@@ -685,6 +746,7 @@ InitLogVars(members, firstEntry) ==
 
 InitAuxVars == 
     /\ electionCtr = 0
+    /\ valueCtr = [v \in 1..MaxElections+1 |-> 0]
     /\ restartCtr = 0
     /\ addReconfigCtr = 0
     /\ removeReconfigCtr = 0
@@ -715,21 +777,19 @@ Init == LET hosts      == CHOOSE s \in SUBSET Hosts :
 
 \* ACTION: Restart -------------------------------------
 \* Server i restarts from stable storage.
-\* It loses everything but its currentEpoch, leader and log.
+\* KRaft durably stores: role, state, currentEpoch, leader, votedFor and log.
 RestartWithState ==
     \E i \in servers :
         /\ restartCtr < MaxRestarts
-        /\ state[i] # Dead
-        /\ state'         = [state EXCEPT ![i] = Unattached]
-        /\ leader'        = [leader EXCEPT ![i] = Nil]
+        /\ state[i] # DeadNoState
         /\ votesGranted'  = [votesGranted EXCEPT ![i] = {}]
         /\ endOffset'     = [endOffset EXCEPT ![i] = [j \in servers |-> 0]]
         /\ highWatermark' = [highWatermark EXCEPT ![i] = 0]
         /\ pendingFetch'  = [pendingFetch EXCEPT ![i] = Nil]
         /\ restartCtr'    = restartCtr + 1
         /\ UNCHANGED <<servers, messages, config, currentEpoch, role, 
-                       votedFor, log, acked, electionCtr,
-                       addReconfigCtr, removeReconfigCtr, diskIdGen>>
+                       state, votedFor, leader, log, acked, electionCtr, 
+                       valueCtr, addReconfigCtr, removeReconfigCtr, diskIdGen>>
 
 \* ACTION: RestartWithoutState
 \* A server that has state and is a member of the cluster
@@ -738,17 +798,24 @@ RestartWithState ==
 \* Either the original server is dead, or is remains as a
 \* functioning zombie server.
 RestartWithoutState ==
-    /\ Cardinality(servers) < MaxTotalServers
+    \* enabling conditions (including state space contraints)
+    /\ restartCtr < MaxRestarts
+    /\ Cardinality(servers) < MaxSpawnedServers
     /\ \E i \in servers, leaveZombie \in BOOLEAN :
-        /\ state[i] # Dead
-        /\ \E j \in servers : i \in config[j].members
+        /\ \E j \in servers :
+            \* there is a voter that includes this server in the current configuration 
+            /\ state[j] = Voter
+            /\ i \in config[j].members
+            /\ Cardinality(config[j].members) > MinClusterSize
+        /\ state[i] # DeadNoState \* once dead with no state, same identity will never be seen again
+        \* state changes
         /\ LET identity == [host |-> i.host, diskId |-> diskIdGen + 1]
            IN /\ IF leaveZombie
                  THEN SetStateOfNewAndDeadIdentity(identity, Nil, i)
                  ELSE SetStateOfNewIdentity(identity, Nil)
               /\ diskIdGen'       = diskIdGen + 1
         /\ UNCHANGED <<messages, acked, electionCtr, restartCtr,
-                       addReconfigCtr, removeReconfigCtr>>
+                       valueCtr, addReconfigCtr, removeReconfigCtr>>
 
 \* ACTION: RequestVote -----------------------------------------------
 \* Combined Timeout and RequestVote of the original spec to reduce
@@ -776,7 +843,7 @@ RequestVote ==
                  msource        |-> i,
                  mdest          |-> j] : j \in config[i].members \ {i}})
         /\ UNCHANGED <<servers, config, role, acked, leaderVars, logVars, restartCtr,
-                       addReconfigCtr, diskIdGen, removeReconfigCtr>>
+                       valueCtr, addReconfigCtr, diskIdGen, removeReconfigCtr>>
 
 \* ACTION: HandleRequestVoteRequest ------------------------------
 \* Server i receives a RequestVote request from server j.
@@ -786,54 +853,54 @@ RequestVote ==
 \* 3) i has not already voted for a different server
 HandleRequestVoteRequest ==
     \E m \in DOMAIN messages :
-        /\ \E i \in servers :
-            /\ ReceivableMessage(m, RequestVoteRequest, AnyEpoch)
-            /\ LET j     == m.msource
-                   error    == IF m.mepoch < currentEpoch[i]
-                               THEN FencedLeaderEpoch
-                               ELSE Nil
-                   state0   == IF m.mepoch > currentEpoch[i]
-                               THEN TransitionToUnattached(m.mepoch)
-                               ELSE NoTransition(i)
-                   logOk == CompareEntries(m.mlastLogOffset,
-                                           m.mlastLogEpoch,
-                                           Len(log[i]),
-                                           LastEpoch(log[i])) >= 0
-                   grant == /\ \/ state0.state = Unattached
-                               \/ /\ state0.state = Voted
-                                  /\ votedFor[i] = j
-                            /\ logOk
-                   finalState == IF grant /\ state0.state = Unattached
-                                 THEN TransitionToVoted(i, m.mepoch, state0)
-                                 ELSE state0                         
-                IN /\ IF error = Nil
-                      THEN
-                           /\ state' = [state EXCEPT ![i] = finalState.state]
-                           /\ currentEpoch' = [currentEpoch EXCEPT ![i] = finalState.epoch]
-                           /\ leader' = [leader EXCEPT ![i] = finalState.leader]
-                           /\ \/ /\ grant
-                                 /\ votedFor' = [votedFor EXCEPT ![i] = j]
-                              \/ /\ ~grant
-                                 /\ UNCHANGED votedFor
-                           /\ IF state # state'
-                              THEN pendingFetch' = [pendingFetch EXCEPT ![i] = Nil]
-                              ELSE UNCHANGED pendingFetch
-                           /\ Reply([mtype         |-> RequestVoteResponse,
-                                     mepoch        |-> m.mepoch,
-                                     mleader       |-> finalState.leader,
-                                     mvoteGranted  |-> grant,
-                                     merror        |-> Nil,
-                                     msource       |-> i,
-                                     mdest         |-> j], m)
-                      ELSE /\ Reply([mtype         |-> RequestVoteResponse,
-                                     mepoch        |-> currentEpoch[i],
-                                     mleader       |-> leader[i],
-                                     mvoteGranted  |-> FALSE,
-                                     merror        |-> error,
-                                     msource       |-> i,
-                                     mdest         |-> j], m)
-                           /\ UNCHANGED << currentEpoch, state, leader, votedFor, pendingFetch>>
-                   /\ UNCHANGED <<servers, role, config, candidateVars, leaderVars, logVars, auxVars>>
+        /\ ReceivableMessage(m, RequestVoteRequest, AnyEpoch)
+        /\ LET i        == m.mdest
+               j        == m.msource
+               error    == IF m.mepoch < currentEpoch[i]
+                           THEN FencedLeaderEpoch
+                           ELSE Nil
+               state0   == IF m.mepoch > currentEpoch[i]
+                           THEN TransitionToUnattached(m.mepoch)
+                           ELSE NoTransition(i)
+               logOk == CompareEntries(m.mlastLogOffset,
+                                       m.mlastLogEpoch,
+                                       Len(log[i]),
+                                       LastEpoch(log[i])) >= 0
+               grant == /\ \/ state0.state = Unattached
+                           \/ /\ state0.state = Voted
+                              /\ votedFor[i] = j
+                        /\ logOk
+               finalState == IF grant /\ state0.state = Unattached
+                             THEN TransitionToVoted(i, m.mepoch, state0)
+                             ELSE state0                         
+            IN /\ IF error = Nil
+                  THEN
+                       /\ state' = [state EXCEPT ![i] = finalState.state]
+                       /\ currentEpoch' = [currentEpoch EXCEPT ![i] = finalState.epoch]
+                       /\ leader' = [leader EXCEPT ![i] = finalState.leader]
+                       /\ \/ /\ grant
+                             /\ votedFor' = [votedFor EXCEPT ![i] = j]
+                          \/ /\ ~grant
+                             /\ UNCHANGED votedFor
+                       /\ IF state # state'
+                          THEN pendingFetch' = [pendingFetch EXCEPT ![i] = Nil]
+                          ELSE UNCHANGED pendingFetch
+                       /\ Reply([mtype         |-> RequestVoteResponse,
+                                 mepoch        |-> m.mepoch,
+                                 mleader       |-> finalState.leader,
+                                 mvoteGranted  |-> grant,
+                                 merror        |-> Nil,
+                                 msource       |-> i,
+                                 mdest         |-> j], m)
+                  ELSE /\ Reply([mtype         |-> RequestVoteResponse,
+                                 mepoch        |-> currentEpoch[i],
+                                 mleader       |-> leader[i],
+                                 mvoteGranted  |-> FALSE,
+                                 merror        |-> error,
+                                 msource       |-> i,
+                                 mdest         |-> j], m)
+                       /\ UNCHANGED << currentEpoch, state, leader, votedFor, pendingFetch>>
+               /\ UNCHANGED <<servers, role, config, candidateVars, leaderVars, logVars, auxVars>>
 
 \* ACTION: HandleRequestVoteResponse --------------------------------
 \* Server i receives a RequestVote response from server j.
@@ -873,7 +940,7 @@ BecomeLeader ==
         /\ votesGranted[i] \in Quorum(config[i].members)
         /\ state'  = [state EXCEPT ![i] = Leader]
         /\ leader' = [leader EXCEPT ![i] = i]
-        /\ endOffset' = [endOffset EXCEPT ![i] = [j \in config[i].members |-> 0]]
+        /\ endOffset' = [endOffset EXCEPT ![i] = [j \in servers |-> 0]]
         /\ SendMultipleOnce(
               {[mtype    |-> BeginQuorumRequest,
                 mepoch   |-> currentEpoch[i],
@@ -897,26 +964,16 @@ HandleBeginQuorumRequest ==
                            THEN FencedLeaderEpoch
                            ELSE Nil
                newState == MaybeTransition(i, m.msource, m.mepoch)
-           IN IF error = Nil
-              THEN
-                   /\ role[i] = Voter \* new check because roles can change with reconfigurations
-                   /\ state' = [state EXCEPT ![i] = newState.state]
-                   /\ leader' = [leader EXCEPT ![i] = newState.leader]
-                   /\ currentEpoch' = [currentEpoch EXCEPT ![i] = newState.epoch]
-                   /\ pendingFetch' = [pendingFetch EXCEPT ![i] = Nil]
-                   /\ Reply([mtype      |-> BeginQuorumResponse,
-                             mepoch     |-> m.mepoch,
-                             msource    |-> i,
-                             mdest      |-> j,
-                             merror     |-> Nil], m)
-              ELSE /\ Reply([mtype      |-> BeginQuorumResponse,
-                             mepoch     |-> currentEpoch[i],
-                             msource    |-> i,
-                             mdest      |-> j,
-                             merror     |-> error], m)
-                   /\ UNCHANGED <<state, leader, currentEpoch, pendingFetch>>
-        /\ UNCHANGED <<servers, config, role, votedFor, log, candidateVars,
-                       leaderVars, highWatermark, auxVars>>
+           IN /\ error = Nil
+              /\ role[i] = Voter \* new check because roles can change with reconfigurations
+              /\ state' = [state EXCEPT ![i] = newState.state]
+              /\ leader' = [leader EXCEPT ![i] = newState.leader]
+              /\ currentEpoch' = [currentEpoch EXCEPT ![i] = newState.epoch]
+              /\ pendingFetch' = [pendingFetch EXCEPT ![i] = Nil]
+              /\ Discard(m)
+        /\ UNCHANGED <<servers, config, role, votedFor, 
+                       logVars, candidateVars, leaderVars, 
+                       auxVars>>
 
 \* ACTION: ClientRequest ----------------------------------
 \* Leader i receives a client request to add v to the log.
@@ -925,12 +982,14 @@ ClientRequest ==
     \E i \in servers, v \in Value : 
         /\ state[i] = Leader
         /\ acked[v] = Nil \* prevent submitting the same value repeatedly
+        /\ valueCtr[currentEpoch[i]] < MaxValuesPerEpoch
         /\ LET entry == [command |-> AppendCommand,
                          epoch   |-> currentEpoch[i],
                          value   |-> v]
                newLog == Append(log[i], entry)
            IN  /\ log' = [log EXCEPT ![i] = newLog]
                /\ acked' = [acked EXCEPT ![v] = FALSE]
+               /\ valueCtr' = [valueCtr EXCEPT ![currentEpoch[i]] = @ + 1]
         /\ UNCHANGED <<servers, messages, serverVars, candidateVars,
                        leaderVars, highWatermark, electionCtr, restartCtr,
                        addReconfigCtr, removeReconfigCtr, diskIdGen>>
@@ -976,19 +1035,28 @@ SendFetchRequest ==
                        logVars, auxVars>>
 
 \* Fetch requests --------------------------------
-\* Note that the server that receives a fetch request
+\* Note 1:
+\* The server that receives a fetch request
 \* can be the leader but not a voter. This can happen
 \* when the leader has switched to being an observer
 \* because it is an acting leader that is continuing until
 \* it can commit a RemoveServerCommand which removes it from the
 \* configuration.
 
+\* Note 2:
+\* We allow fetches from voters that are not in
+\* the current configuration because they may not have
+\* reached the reconfiguration command yet. Once they do
+\* they will switch to being an observer. Also this follower
+\* may be required in order to commit the command, so if
+\* the leader rejects fetches from this follower then it
+\* would block further progress completely - a stuck cluster.
+
 \* ACTION: RejectFetchRequest -------------------
 \* Server i rejects a FetchRequest due to either:
 \* - i is not a leader
 \* - the message epoch is lower than the server epoch
 \* - the message epoch is higher than the server epoch
-\* - the request is from a server not in the current configuration
 RejectFetchRequest ==
     \E m \in DOMAIN messages :
         /\ ReceivableMessage(m, FetchRequest, AnyEpoch)
@@ -997,7 +1065,6 @@ RejectFetchRequest ==
                error               == CASE state[i] # Leader -> NotLeader
                                         [] m.mepoch < currentEpoch[i] -> FencedLeaderEpoch
                                         [] m.mepoch > currentEpoch[i] -> UnknownLeader
-                                        [] m.mobserver = FALSE /\ j \notin config[i].members -> UnknownMember
                                         [] OTHER -> Nil
            IN  /\ error # Nil
                /\ Reply([mtype       |-> FetchResponse,
@@ -1025,8 +1092,6 @@ DivergingFetchRequest ==
                validPosition       == ValidFetchPosition(i, m)
                validOffsetAndEpoch == EndOffsetForEpoch(i, m.mlastFetchedEpoch)
            IN  /\ state[i] = Leader
-               /\ \/ m.mobserver = TRUE
-                  \/ j \in config[i].members
                /\ ~validPosition 
                /\ Reply([mtype               |-> FetchResponse,
                          mepoch              |-> currentEpoch[i],
@@ -1090,7 +1155,6 @@ AcceptFetchRequestFromVoter ==
            IN 
               /\ state[i] = Leader
               /\ m.mobserver = FALSE
-              /\ j \in config[i].members
               /\ validPosition
               /\ LET newEndOffset  == [endOffset[i] EXCEPT ![j] = m.mfetchOffset]
                      newHwm        == NewHighwaterMark(i, newEndOffset)
@@ -1133,7 +1197,7 @@ AcceptFetchRequestFromVoter ==
                               mdest       |-> j,
                               correlation |-> m], m)
                     /\ UNCHANGED <<servers, currentEpoch, log, 
-                                   votedFor, pendingFetch, electionCtr, 
+                                   votedFor, pendingFetch, electionCtr, valueCtr,
                                    restartCtr, addReconfigCtr, removeReconfigCtr, diskIdGen>>
 
 \* ACTION: AcceptFetchRequestFromVoter ------------------
@@ -1184,17 +1248,17 @@ HandleSuccessFetchResponse ==
                currConfig  == ConfigFor(configEntry.offset,
                                         configEntry.entry,
                                         m.mhwm)
-           IN /\ newState.handled = FALSE
+           IN /\ m.mresult = Ok
+              /\ newState.handled = FALSE
               /\ pendingFetch[i] = m.correlation
-              /\ m.mresult = Ok
               \* The server could have received a reconfiguration command
-              /\ MaybeSwitchConfigurations(i, currConfig)                    
+              /\ MaybeSwitchConfigurations(i, currConfig, newState)                    
               \* update log and hwm
               /\ highWatermark'  = [highWatermark  EXCEPT ![i] = m.mhwm]
               /\ log' = newLog
               /\ pendingFetch' = [pendingFetch EXCEPT ![i] = Nil]
               /\ Discard(m)
-              /\ UNCHANGED <<servers, currentEpoch, leader, votedFor, 
+              /\ UNCHANGED <<servers, currentEpoch, votedFor, 
                              candidateVars, auxVars>>
 
 \* ACTION: HandleDivergingFetchResponse
@@ -1216,35 +1280,39 @@ HandleDivergingFetchResponse ==
                                         configEntry.entry,
                                         m.mhwm)
            IN 
+              /\ m.mresult = Diverging
               /\ newState.handled = FALSE
               /\ pendingFetch[i] = m.correlation
-              /\ m.mresult = Diverging
               \* The server could have truncated the reconfig command
               \* of the current configuration, causing the server
               \* to revert to the prior configuration.
-              /\ MaybeSwitchConfigurations(i, currConfig)
+              /\ MaybeSwitchConfigurations(i, currConfig, newState)
               \* update log
               /\ log' = newLog
               /\ pendingFetch' = [pendingFetch EXCEPT ![i] = Nil] 
               /\ Discard(m)
-        /\ UNCHANGED <<servers, currentEpoch, leader, votedFor, 
+        /\ UNCHANGED <<servers, currentEpoch, votedFor, 
                        candidateVars, highWatermark, auxVars>>
                        
-\* ACTION: HandleErrorFetchResponse
-\* Server i receives a FetchResponse with an error from server j with
-\* Depending on the error, the follower may transition to being unattached
-\* or being the follower of a new leader that it was not aware of.
+\* ACTION: HandleNonSuccessFetchResponse
+\* Server i receives a FetchResponse from server j that
+\* satisfies one of the conditions:
+\* - it is an error response
+\* - has entered an illegal state
+\* - i transitions to a new state where no further processing
+\*   of this message should happen. Such as transitioning to 
+\*   follower state in a new epoch.
 \* If this is an observer and the error was NotLeader and the id of
 \* the leader was included in the response, the observer can now send
 \* fetches to that leader. 
-HandleErrorFetchResponse ==
+HandleNonSuccessFetchResponse ==
     \E m \in DOMAIN messages :
         /\ ReceivableMessage(m, FetchResponse, AnyEpoch)
         /\ LET i        == m.mdest
                j        == m.msource
                newState == MaybeHandleCommonResponse(i, m.mleader, m.mepoch, m.merror)
            IN
-              /\ newState.handled = TRUE
+              /\ newState.handled
               /\ pendingFetch[i] = m.correlation
               /\ state' = [state EXCEPT ![i] = newState.state]
               /\ leader' = [leader EXCEPT ![i] = newState.leader]
@@ -1269,7 +1337,7 @@ HandleErrorFetchResponse ==
 \* an composite identity based on host and a random id
 \* called diskId and in the observer role.
 StartNewServer ==
-    /\ Cardinality(servers) < MaxTotalServers
+    /\ Cardinality(servers) < MaxSpawnedServers
     /\ \E host \in Hosts, anyLeader \in servers :
         LET diskId    == diskIdGen + 1
             identity  == [host |-> host, diskId |-> diskId]
@@ -1285,7 +1353,7 @@ StartNewServer ==
               IN /\ SetStateOfNewIdentity(identity, fetchMsg)
                  /\ Send(fetchMsg)
            /\ UNCHANGED << acked, electionCtr, restartCtr, addReconfigCtr, 
-                           removeReconfigCtr >>
+                           removeReconfigCtr, valueCtr >>
 
 \* ACTION: SendJoinRequest
 \* An observer can request to join the cluster as a voter
@@ -1299,6 +1367,7 @@ StartNewServer ==
 SendJoinRequest ==
     /\ addReconfigCtr < MaxAddReconfigs
     /\ \E i, j \in servers :
+        /\ i # j
         /\ role[i] = Observer
         /\ i \notin config[i].members
         /\ leader[i] = j
@@ -1390,33 +1459,73 @@ RejectJoinRequest ==
                              leaderVars, logVars, auxVars>>                                 
 
 \* ACTION: HandleJoinResponse ----------------------------------
-\* Observer i receives a JoinResponse. If it was a rejection
-\* then we may:
+\* Observer i receives a rejection JoinResponse. We may:
 \* - transition to unattached if the source doesn't know who the leader is
 \* - send a new JoinRequest if the error wasn't AlreadyMember and the source
 \*   knows who the leader is
-\* If it was a success response then the observer simply carries on being an observer
+\* We don't model a success response as the observer simply carries on being an observer
 \* until it sees the AddServerCommand in our log.
-HandleJoinResponse ==
+\*
+\* Note this does not use MaybeHandleCommonResponse as that
+\* function needed modifying which introduced other unexpected
+\* behaviour leading to invariant violations.
+\* I recommend removing that function entirely as it makes
+\* reasoning about the logic much harder. Modifying it can easily
+\* break something in a non-obvious way. Best to put the
+\* conditions clearly inside each Handle* method so it is
+\* easy to reason about, even if it introduces more duplicate
+\* code.
+HandleRejectJoinResponse ==
     \E m \in DOMAIN messages :
         /\ ReceivableMessage(m, JoinResponse, AnyEpoch)
         /\ LET i        == m.mdest
                j        == m.msource
-               newState == MaybeHandleCommonResponse(i, m.mleader, m.mepoch, m.merror)
            IN
               /\ role[i] = Observer
-              /\ newState.handled = TRUE
-              /\ state' = [state EXCEPT ![i] = newState.state]
-              /\ leader' = [leader EXCEPT ![i] = newState.leader]
-              /\ currentEpoch' = [currentEpoch EXCEPT ![i] = newState.epoch]
-              /\ IF m.merror # AlreadyMember /\ newState.leader # Nil
-                 THEN Reply([mtype      |-> JoinRequest,
-                             mepoch     |-> newState.epoch,
-                             mdest      |-> newState.leader,
-                             msource    |-> i], m)
-                 ELSE Discard(m)
+              /\ m.mresult = NotOk
+              /\ CASE /\ m.mepoch >= currentEpoch[i]
+                      /\ m.mresult \in { NotLeader, FencedLeaderEpoch }
+                      /\ m.mleader # Nil ->
+                            /\ leader' = [leader EXCEPT ![i] = m.mleader]
+                            /\ currentEpoch' = [currentEpoch EXCEPT ![i] = m.mepoch]
+                            /\ Reply([mtype      |-> JoinRequest,
+                                      mepoch     |-> currentEpoch[i],
+                                      mdest      |-> m.mleader,
+                                      msource    |-> i], m)
+                            /\ UNCHANGED << state >>
+                   [] /\ m.mepoch >= currentEpoch[i]
+                      /\ m.mresult \in { NotLeader, FencedLeaderEpoch }
+                      /\ m.mleader = Nil ->
+                            /\ leader' = [leader EXCEPT ![i] = Nil]
+                            /\ state' = [state EXCEPT ![i] = Unattached]
+                            /\ currentEpoch' = [currentEpoch EXCEPT ![i] = m.mepoch]
+                            /\ Discard(m)
+                   [] OTHER ->
+                            /\ Discard(m)
+                            /\ UNCHANGED << leader, state, currentEpoch >>
         /\ UNCHANGED <<servers, role, config, votedFor, pendingFetch, candidateVars, leaderVars, 
-                       logVars, auxVars>>   
+                       logVars, auxVars>>
+                       
+\*HandleRejectJoinResponseOLd ==
+\*    \E m \in DOMAIN messages :
+\*        /\ ReceivableMessage(m, JoinResponse, AnyEpoch)
+\*        /\ LET i        == m.mdest
+\*               j        == m.msource
+\*               newState == MaybeHandleCommonResponse(i, m.mleader, m.mepoch, m.merror)
+\*           IN
+\*              /\ role[i] = Observer
+\*              /\ newState.handled = TRUE
+\*              /\ state' = [state EXCEPT ![i] = newState.state]
+\*              /\ leader' = [leader EXCEPT ![i] = newState.leader]
+\*              /\ currentEpoch' = [currentEpoch EXCEPT ![i] = newState.epoch]
+\*              /\ IF m.merror # AlreadyMember /\ newState.leader # Nil
+\*                 THEN Reply([mtype      |-> JoinRequest,
+\*                             mepoch     |-> newState.epoch,
+\*                             mdest      |-> newState.leader,
+\*                             msource    |-> i], m)
+\*                 ELSE Discard(m)
+\*        /\ UNCHANGED <<servers, role, config, votedFor, pendingFetch, candidateVars, leaderVars, 
+\*                       logVars, auxVars>>                             
 
 \* ACTION: HandleRemoveRequest ----------------------------------
 \* Leader i accepts a valid RemoveRequest from an Administrator and
@@ -1459,12 +1568,11 @@ HandleRemoveRequest ==
                /\ IF i = removeServer
                   THEN role' = [role EXCEPT ![i] = Observer]
                   ELSE UNCHANGED role
-               \* remove tracking of the end offset of this member
-               /\ endOffset' = [endOffset EXCEPT ![i] = 
-                                  [j \in entry.value.members |-> endOffset[i][j]]]
-        /\ UNCHANGED <<servers, messages, candidateVars, 
-                       currentEpoch, state, leader, votedFor, pendingFetch,
-                       highWatermark, auxVars>>  
+               /\ removeReconfigCtr' = removeReconfigCtr + 1                                 
+        /\ UNCHANGED <<servers, messages, candidateVars,  currentEpoch, 
+                       state, leader, votedFor, pendingFetch, leaderVars,
+                       highWatermark, acked, electionCtr, restartCtr,
+                       valueCtr, addReconfigCtr, diskIdGen>>  
 
 ----
 \* Defines how the variables may transition.
@@ -1487,13 +1595,13 @@ Next ==
         \/ SendFetchRequest
         \/ HandleSuccessFetchResponse
         \/ HandleDivergingFetchResponse
-        \/ HandleErrorFetchResponse
+        \/ HandleNonSuccessFetchResponse
         \* reconfiguration actions
         \/ StartNewServer
         \/ SendJoinRequest
         \/ AcceptJoinRequest
         \/ RejectJoinRequest
-        \/ HandleJoinResponse
+        \/ HandleRejectJoinResponse
         \/ HandleRemoveRequest
 
 NoStuttering ==
@@ -1504,31 +1612,78 @@ Spec == Init /\ [][Next]_vars
 LivenessSpec == Init /\ [][Next]_vars /\ NoStuttering
 
 ----
-\* LIVENESS -------------------------
+\* LIVENESS PROPERTIES -------------------------
+\* Note that due to the number of elections being limited,
+\* the last possible election could fail and prevent
+\* progress, so these liveness formulas only apply in cases
+\* where the behaviour does not end with all elections used up
+\* and no elected leader in the current configuration.
 
-\* ValuesNotStuck -----------------
+NoProgressPossible ==
+    /\ electionCtr = MaxElections
+    /\ ~\E i \in servers : 
+        /\ state[i] = Leader
+        /\ \E j \in servers : 
+            /\ state[j] = Voter
+            /\ i \in config[j].members
+
+\* LIVENESS: ValuesNotStuck -----------------
 \* A client value will either get committed and be
 \* fully replicated or it will be truncated and
 \* not be found on any server log.
-\* Note that due to the number of elections being limited,
-\* the last possible election could fail and prevent
-\* progress, so this liveness formula only apples in cases
-\* a behaviour does not end with all elections used up
-\* and no elected leader.
-ValueInServerLog(i, v) ==
-    \E offset \in DOMAIN log[i] :
-        log[i][offset].value = v
+IsCurrentLeader(i) ==
+    /\ state[i] = Leader
+    \* and which is the newest leader (aka not stale)
+    /\ ~\E l \in servers : 
+        /\ l # i
+        /\ currentEpoch[l] > currentEpoch[i]
 
-ValueAllOrNothing(v) ==
-    IF /\ electionCtr = MaxElections
-       /\ ~\E i \in servers : state[i] = Leader
+ValueNotInServerLog(i, v) ==
+    ~\E offset \in DOMAIN log[i] :
+        log[i][offset].value = v
+        
+ValueInServerLogAndCommitted(i, v) ==
+    \E offset \in DOMAIN log[i] :
+        /\ log[i][offset].value = v
+        /\ highWatermark[i] >= offset       
+
+CommittedValueOrNothing(v) ==
+    IF NoProgressPossible
     THEN TRUE
-    ELSE \/ \A i \in servers : ValueInServerLog(i, v)
-         \/ ~\E i \in servers : ValueInServerLog(i, v)
+    ELSE \E l \in servers : 
+            /\ IsCurrentLeader(l)
+            /\ \/ \A i \in config[l].members : ValueInServerLogAndCommitted(i, v)
+               \/ \A i \in config[l].members : ValueNotInServerLog(i, v)
 
 ValuesNotStuck ==
-    \A v \in Value : []<>ValueAllOrNothing(v)
-    
+    \A v \in Value : []<>CommittedValueOrNothing(v)
+
+\* LIVENESS: ReconfigurationCompletes -----------
+\* A reconfiguration command will either get committed and be
+\* fully replicated or it will be truncated and
+\* not be found on any server log.
+ConfigNotInServerLog(i, config_id) ==
+    ~\E offset \in DOMAIN log[i] :
+        /\ IsConfigCommand(log[i], offset)
+        /\ log[i][offset].value.id = config_id
+
+ConfigInServerLogAndCommitted(i, config_id) ==
+    \E offset \in DOMAIN log[i] :
+        /\ IsConfigCommand(log[i], offset)
+        /\ log[i][offset].value.id = config_id
+        /\ highWatermark[i] >= offset
+
+ConfigAllOrNothing(config_id) ==
+    IF NoProgressPossible
+    THEN TRUE
+    ELSE \E l \in servers : 
+            /\ IsCurrentLeader(l)
+            /\ \/ \A i \in config[l].members : ConfigInServerLogAndCommitted(i, config_id)
+               \/ \A i \in config[l].members : ConfigNotInServerLog(i, config_id)
+
+ReconfigurationNotStuck ==
+    \A config_id \in 1..(MaxAddReconfigs + MaxRemoveReconfigs) :
+        []<>ConfigAllOrNothing(config_id)
 
 \* INVARIANTS -------------------------
 
@@ -1601,9 +1756,23 @@ LeaderHasAllAckedValues ==
                     log[i][offset].value = v
         ELSE TRUE
 
+\* INV: MaxOneReconfigurationAtATime
+\* The Raft reconfiguration algorithm is only
+\* safe if there is one reconfiguration operation in-progress
+\* at a time.
+MaxOneReconfigurationAtATime ==
+    ~\E i \in servers :
+        /\ state[i] = Leader
+        /\ \E offset1, offset2 \in DOMAIN log[i] :
+            /\ offset1 # offset2
+            /\ IsConfigCommand(log[i], offset1)
+            /\ IsConfigCommand(log[i], offset2)
+            /\ highWatermark[i] < offset1
+            /\ highWatermark[i] < offset2
+
 ===============================================================================
 \* Note: GUNMETAL is my (Jack here) beast workstation built for model checking specs. 
 \* Modification History
-\* Last modified Sat Jul 16 18:02:31 CEST 2022 by GUNMETAL
+\* Last modified Sun Jul 17 16:23:44 CEST 2022 by GUNMETAL
 \* Last modified Sat Jul 16 11:14:02 CEST 2022 by jvanlightly
 \* Created Wed Jun 29 17:56:38 CEST 2022 by jvanlightly
